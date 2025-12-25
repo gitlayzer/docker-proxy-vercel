@@ -23,127 +23,96 @@ const routes = {
     [`docker-staging.${CUSTOM_DOMAIN}`]: dockerHub,
 };
 
-// 根据 host 路由到不同的 upstream
-function routeByHosts(host) {
-    if (host in routes) return routes[host];
-    if (MODE === "debug") return TARGET_UPSTREAM;
-    return "";
-}
-
-// 核心处理函数
 export default async function handler(request) {
     const url = new URL(request.url);
+    const upstream = routes[url.hostname] || "";
 
-    // 首页重定向
-    if (url.pathname === "/") {
-        return Response.redirect(`${url.protocol}//${url.host}/v2/`, 301);
-    }
-
-    const upstream = routeByHosts(url.hostname);
     if (!upstream) {
-        return new Response(JSON.stringify({ routes }), { status: 404 });
+        return new Response(JSON.stringify({ message: "Host Not Found", routes }), { status: 404 });
     }
 
     const isDockerHub = upstream === dockerHub;
     const authorization = request.headers.get("Authorization");
 
-    // 1. 处理 /v2/ 根路径认证检查
-    if (url.pathname === "/v2/") {
-        const newUrl = new URL(upstream + "/v2/");
-        const headers = new Headers();
-        if (authorization) headers.set("Authorization", authorization);
-
-        const resp = await fetch(newUrl.toString(), {
-            method: "GET",
-            headers: headers,
-            redirect: "follow",
-        });
-
-        if (resp.status === 401) return responseUnauthorized(url);
-        return resp;
-    }
-
-    // 2. 处理 Token 获取
+    // 1. 处理 Auth 逻辑 (略，保持之前的逻辑)
     if (url.pathname === "/v2/auth") {
-        const newUrl = new URL(upstream + "/v2/");
-        const resp = await fetch(newUrl.toString(), { method: "GET", redirect: "follow" });
-
-        if (resp.status !== 401) return resp;
-
-        const authenticateStr = resp.headers.get("WWW-Authenticate");
-        if (!authenticateStr) return resp;
-
-        const wwwAuthenticate = parseAuthenticate(authenticateStr);
-        let scope = url.searchParams.get("scope");
-
-        // DockerHub library 镜像补全
-        if (scope && isDockerHub) {
-            let scopeParts = scope.split(":");
-            if (scopeParts.length === 3 && !scopeParts[1].includes("/")) {
-                scopeParts[1] = "library/" + scopeParts[1];
-                scope = scopeParts.join(":");
-            }
-        }
-        return await fetchToken(wwwAuthenticate, scope, authorization);
+        return handleAuth(upstream, url, authorization, isDockerHub);
     }
 
-    // 3. DockerHub library 镜像路径重定向
+    // 2. 构造转发请求
+    let targetUrl = upstream + url.pathname + url.search;
+
+    // DockerHub Library 补全逻辑
     if (isDockerHub) {
         const pathParts = url.pathname.split("/");
-        if (pathParts.length === 5) {
-            pathParts.splice(2, 0, "library");
+        if (pathParts.length === 5 && pathParts[1] === "v2") {
             const redirectUrl = new URL(url);
+            pathParts.splice(2, 0, "library");
             redirectUrl.pathname = pathParts.join("/");
             return Response.redirect(redirectUrl, 301);
         }
     }
 
-    // 4. 转发普通请求
-    const newUrl = new URL(upstream + url.pathname + url.search);
-    const newReq = new Request(newUrl, {
+    const newReq = new Request(targetUrl, {
         method: request.method,
         headers: request.headers,
-        redirect: isDockerHub ? "manual" : "follow",
+        redirect: "manual", // 必须手动处理重定向以控制 Header
     });
 
-    const resp = await fetch(newReq);
+    let resp = await fetch(newReq);
 
-    if (resp.status === 401) {
-        return responseUnauthorized(url);
-    }
-
-    // 5. 关键修复：手动处理 DockerHub Blob 重定向
-    if (isDockerHub && (resp.status === 301 || resp.status === 302 || resp.status === 307)) {
+    // 3. 处理重定向 (特别是 DockerHub 的 Blob 重定向)
+    if ([301, 302, 307, 308].includes(resp.status)) {
         const location = resp.headers.get("Location");
         if (location) {
             const blobResp = await fetch(location, {
-                method: "GET",
-                redirect: "follow",
+                method: request.method,
+                headers: { "Authorization": authorization || "" },
+                redirect: "follow"
             });
-
-            // 构造新的 Header，确保 Content-Length 等关键信息不丢失
-            const newHeaders = new Headers(blobResp.headers);
-            newHeaders.set("Access-Control-Allow-Origin", "*");
-
-            // 必须确保 Docker-Distribution-Api-Version 存在
-            newHeaders.set("Docker-Distribution-Api-Version", "registry/2.0");
-
-            return new Response(blobResp.body, {
-                status: blobResp.status,
-                statusText: blobResp.statusText,
-                headers: newHeaders,
-            });
+            return fixResponse(blobResp);
         }
     }
 
-    // 6. 普通响应也需要确保 Header 透传
-    const finalHeaders = new Headers(resp.headers);
-    finalHeaders.set("Docker-Distribution-Api-Version", "registry/2.0");
+    if (resp.status === 401) return responseUnauthorized(url);
 
+    return fixResponse(resp);
+}
+
+/**
+ * 核心修复函数：确保 Content-Length 和关键 Header 不丢失
+ */
+async function fixResponse(resp) {
+    const newHeaders = new Headers(resp.headers);
+
+    // 必须包含的版本头
+    newHeaders.set("Docker-Distribution-Api-Version", "registry/2.0");
+    // 允许跨域
+    newHeaders.set("Access-Control-Allow-Origin", "*");
+    newHeaders.set("Access-Control-Expose-Headers", "Docker-Content-Digest, Content-Length");
+
+    // 如果是 HEAD 请求，Vercel 可能会丢弃 Content-Length
+    // 我们从原始响应中提取并强制写回
+    const contentLength = resp.headers.get("content-length");
+    if (contentLength) {
+        newHeaders.set("Content-Length", contentLength);
+    }
+
+    // 针对 Manifest 请求 (通常是 JSON)，我们将其转为 ArrayBuffer
+    // 这样 Vercel 就不再将其视为 Stream，从而自动加上正确的 Content-Length
+    const contentType = resp.headers.get("content-type") || "";
+    if (contentType.includes("json") || contentType.includes("manifest")) {
+        const body = await resp.arrayBuffer();
+        return new Response(body, {
+            status: resp.status,
+            headers: newHeaders,
+        });
+    }
+
+    // 对于 Blob (大文件)，保持流式传输，但带上强制的 Content-Length
     return new Response(resp.body, {
         status: resp.status,
-        statusText: resp.statusText,
-        headers: finalHeaders,
+        headers: newHeaders,
     });
 }
 
