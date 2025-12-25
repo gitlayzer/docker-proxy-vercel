@@ -1,5 +1,3 @@
-const fetch = require('node-fetch');
-
 const dockerHub = "https://registry-1.docker.io";
 const CUSTOM_DOMAIN = process.env.CUSTOM_DOMAIN;
 
@@ -14,102 +12,53 @@ const routes = {
     [`ecr.${CUSTOM_DOMAIN}`]: "https://public.ecr.aws",
 };
 
-module.exports = async (req, res) => {
-    const host = req.headers.host;
-    const upstream = routes[host];
-
-    if (!upstream) {
-        return res.status(404).json({ error: "Host Not Found", host });
-    }
-
-    const isDockerHub = upstream === dockerHub;
-    const authorization = req.headers.authorization;
-
-    // 1. 处理首页跳转
-    if (req.url === "/" || req.url === "") {
-        res.setHeader('Location', '/v2/');
-        return res.status(301).end();
-    }
-
-    // 2. 处理 Token 认证 (v2/auth)
-    if (req.url.startsWith("/v2/auth")) {
-        return await handleAuth(upstream, req, res, isDockerHub);
-    }
-
-    // 3. 构造上游路径
-    let targetPath = req.url;
-    if (isDockerHub) {
-        const pathParts = targetPath.split("/");
-        if (pathParts.length === 5 && pathParts[1] === "v2" && !pathParts[2].includes("/")) {
-            pathParts.splice(2, 0, "library");
-            targetPath = pathParts.join("/");
-        }
-    }
-
-    // 4. 转发请求到上游
-    const targetUrl = upstream + targetPath;
-
-    try {
-        const response = await fetch(targetUrl, {
-            method: req.method,
-            headers: filterHeaders(req.headers),
-            redirect: 'manual'
-        });
-
-        // 处理重定向 (特别是 DockerHub 的 Blob 下载)
-        if ([301, 302, 307, 308].includes(response.status)) {
-            const location = response.headers.get('location');
-            if (location) {
-                // 如果是重定向到存储桶，直接重定向让客户端自己下载，或者再次代理
-                res.setHeader('Location', location);
-                return res.status(response.status).end();
-            }
-        }
-
-        // 处理 401
-        if (response.status === 401) {
-            return responseUnauthorized(res, host);
-        }
-
-        // 5. 核心修复：手动读取 Body 并设置 Content-Length
-        const body = await response.buffer();
-
-        // 复制所有上游 Header
-        response.headers.forEach((value, key) => {
-            // 跳过可能导致冲突的编码头
-            if (['transfer-encoding', 'content-encoding', 'connection'].includes(key.toLowerCase())) return;
-            res.setHeader(key, value);
-        });
-
-        // 强制设置关键 Header
-        res.setHeader('Docker-Distribution-Api-Version', 'registry/2.0');
-        res.setHeader('Content-Length', body.length);
-        res.setHeader('Access-Control-Allow-Origin', '*');
-
-        // 发送响应
-        return res.status(response.status).send(body);
-
-    } catch (error) {
-        console.error("Proxy Error:", error);
-        return res.status(500).end("Internal Server Error");
-    }
-};
+/**
+ * 助手函数：过滤请求头
+ */
+function filterHeaders(headers) {
+    const out = {};
+    Object.keys(headers).forEach(key => {
+        // 必须移除 host 头，否则上游服务器会报 404/403
+        if (['host', 'connection', 'content-length'].includes(key.toLowerCase())) return;
+        out[key] = headers[key];
+    });
+    return out;
+}
 
 /**
- * 认证逻辑
+ * 助手函数：构造 401 响应
  */
-async function handleAuth(upstream, req, res, isDockerHub) {
-    const resp = await fetch(upstream + "/v2/", { method: "GET" });
+function responseUnauthorized(res, host) {
+    const body = JSON.stringify({ message: "UNAUTHORIZED" });
+    res.setHeader('Www-Authenticate', `Bearer realm="https://${host}/v2/auth",service="vercel-docker-proxy"`);
+    res.setHeader('Docker-Distribution-Api-Version', 'registry/2.0');
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Content-Length', Buffer.byteLength(body));
+    res.statusCode = 401;
+    return res.end(body);
+}
+
+/**
+ * 助手函数：处理 Auth
+ */
+async function handleAuth(upstream, req, res, host, isDockerHub) {
+    const checkUrl = upstream + "/v2/";
+    const resp = await fetch(checkUrl, { method: "GET" });
     const authHeader = resp.headers.get("www-authenticate");
-    if (!authHeader) return res.status(resp.status).end();
+    if (!authHeader) {
+        res.statusCode = resp.status;
+        return res.end();
+    }
 
     const matches = authHeader.match(/(?<=\=")(?:\\.|[^"\\])*(?=")/g);
-    if (!matches || matches.length < 2) return res.status(401).end();
+    if (!matches || matches.length < 2) {
+        res.statusCode = 401;
+        return res.end();
+    }
 
     const realm = matches[0];
     const service = matches[1];
-
-    const url = new URL(req.url, `http://${req.headers.host}`);
+    const url = new URL(req.url, `https://${host}`);
     const tokenUrl = new URL(realm);
     tokenUrl.searchParams.set("service", service);
 
@@ -127,29 +76,88 @@ async function handleAuth(upstream, req, res, isDockerHub) {
         headers: req.headers.authorization ? { 'Authorization': req.headers.authorization } : {}
     });
 
-    const body = await tokenResp.buffer();
+    const arrayBuffer = await tokenResp.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
     res.setHeader('Content-Type', 'application/json');
-    res.setHeader('Content-Length', body.length);
-    return res.status(tokenResp.status).send(body);
+    res.setHeader('Content-Length', buffer.length);
+    res.statusCode = tokenResp.status;
+    return res.end(buffer);
 }
 
-/**
- * 构造统一的 401 响应
- */
-function responseUnauthorized(res, host) {
-    const body = JSON.stringify({ message: "UNAUTHORIZED" });
-    res.setHeader('Www-Authenticate', `Bearer realm="https://${host}/v2/auth",service="vercel-docker-proxy"`);
-    res.setHeader('Docker-Distribution-Api-Version', 'registry/2.0');
-    res.setHeader('Content-Type', 'application/json; charset=utf-8');
-    res.setHeader('Content-Length', Buffer.byteLength(body));
-    return res.status(401).send(body);
-}
+// 主处理函数
+module.exports = async (req, res) => {
+    const host = req.headers.host;
+    const upstream = routes[host];
 
-function filterHeaders(headers) {
-    const out = {};
-    Object.keys(headers).forEach(key => {
-        if (['host', 'connection'].includes(key.toLowerCase())) return;
-        out[key] = headers[key];
-    });
-    return out;
-}
+    if (!upstream) {
+        res.statusCode = 404;
+        return res.end(JSON.stringify({ error: "Host Not Found", host }));
+    }
+
+    const isDockerHub = upstream === dockerHub;
+
+    // 1. 处理首页跳转
+    if (req.url === "/" || req.url === "") {
+        res.setHeader('Location', '/v2/');
+        res.statusCode = 301;
+        return res.end();
+    }
+
+    // 2. 处理 Auth 路径
+    if (req.url.startsWith("/v2/auth")) {
+        return await handleAuth(upstream, req, res, host, isDockerHub);
+    }
+
+    // 3. 构造路径
+    let targetPath = req.url;
+    if (isDockerHub) {
+        const pathParts = targetPath.split("/");
+        if (pathParts.length === 5 && pathParts[1] === "v2" && !pathParts[2].includes("/")) {
+            pathParts.splice(2, 0, "library");
+            targetPath = pathParts.join("/");
+        }
+    }
+
+    // 4. 转发请求
+    const targetUrl = upstream + targetPath;
+    try {
+        const response = await fetch(targetUrl, {
+            method: req.method,
+            headers: filterHeaders(req.headers),
+            redirect: 'manual'
+        });
+
+        // 拦截 401
+        if (response.status === 401) {
+            return responseUnauthorized(res, host);
+        }
+
+        // 处理重定向
+        if ([301, 302, 307, 308].includes(response.status)) {
+            res.setHeader('Location', response.headers.get('location'));
+            res.statusCode = response.status;
+            return res.end();
+        }
+
+        // 读取内容并强制注入 Content-Length
+        const arrayBuffer = await response.arrayBuffer();
+        const buffer = Buffer.from(arrayBuffer);
+
+        response.headers.forEach((value, key) => {
+            if (['transfer-encoding', 'content-encoding', 'connection', 'content-length'].includes(key.toLowerCase())) return;
+            res.setHeader(key, value);
+        });
+
+        res.setHeader('Docker-Distribution-Api-Version', 'registry/2.0');
+        res.setHeader('Content-Length', buffer.length);
+        res.setHeader('Access-Control-Allow-Origin', '*');
+
+        res.statusCode = response.status;
+        return res.end(buffer);
+
+    } catch (err) {
+        res.statusCode = 500;
+        return res.end(JSON.stringify({ error: err.message }));
+    }
+};
