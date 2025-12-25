@@ -107,15 +107,44 @@ export default async function handler(request) {
     });
 
     const resp = await fetch(newReq);
-    if (resp.status === 401) return responseUnauthorized(url);
 
-    // 5. 手动处理 DockerHub Blob 重定向 (避免跨域/Header冲突)
-    if (isDockerHub && resp.status === 307) {
-        const location = new URL(resp.headers.get("Location"));
-        return fetch(location.toString(), { method: "GET", redirect: "follow" });
+    if (resp.status === 401) {
+        return responseUnauthorized(url);
     }
 
-    return resp;
+    // 5. 关键修复：手动处理 DockerHub Blob 重定向
+    if (isDockerHub && (resp.status === 301 || resp.status === 302 || resp.status === 307)) {
+        const location = resp.headers.get("Location");
+        if (location) {
+            const blobResp = await fetch(location, {
+                method: "GET",
+                redirect: "follow",
+            });
+
+            // 构造新的 Header，确保 Content-Length 等关键信息不丢失
+            const newHeaders = new Headers(blobResp.headers);
+            newHeaders.set("Access-Control-Allow-Origin", "*");
+
+            // 必须确保 Docker-Distribution-Api-Version 存在
+            newHeaders.set("Docker-Distribution-Api-Version", "registry/2.0");
+
+            return new Response(blobResp.body, {
+                status: blobResp.status,
+                statusText: blobResp.statusText,
+                headers: newHeaders,
+            });
+        }
+    }
+
+    // 6. 普通响应也需要确保 Header 透传
+    const finalHeaders = new Headers(resp.headers);
+    finalHeaders.set("Docker-Distribution-Api-Version", "registry/2.0");
+
+    return new Response(resp.body, {
+        status: resp.status,
+        statusText: resp.statusText,
+        headers: finalHeaders,
+    });
 }
 
 // 辅助函数 (保持逻辑一致)
