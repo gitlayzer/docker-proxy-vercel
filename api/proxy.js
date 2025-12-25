@@ -1,6 +1,4 @@
-export const config = {
-    runtime: 'edge',
-};
+const fetch = require('node-fetch');
 
 const dockerHub = "https://registry-1.docker.io";
 const CUSTOM_DOMAIN = process.env.CUSTOM_DOMAIN;
@@ -16,107 +14,104 @@ const routes = {
     [`ecr.${CUSTOM_DOMAIN}`]: "https://public.ecr.aws",
 };
 
-export default async function handler(request) {
-    const url = new URL(request.url);
-    const upstream = routes[url.hostname];
+module.exports = async (req, res) => {
+    const host = req.headers.host;
+    const upstream = routes[host];
 
     if (!upstream) {
-        return new Response(JSON.stringify({ error: "Host Not Found" }), { status: 404 });
+        return res.status(404).json({ error: "Host Not Found", host });
     }
 
     const isDockerHub = upstream === dockerHub;
-    const authorization = request.headers.get("Authorization");
+    const authorization = req.headers.authorization;
 
-    // 1. 处理首页重定向 (301 本身不需要 Content-Length，但我们保证它规范)
-    if (url.pathname === "/") {
-        return Response.redirect(`${url.protocol}//${url.host}/v2/`, 301);
+    // 1. 处理首页跳转
+    if (req.url === "/" || req.url === "") {
+        res.setHeader('Location', '/v2/');
+        return res.status(301).end();
     }
 
-    // 2. 认证逻辑处理
-    if (url.pathname === "/v2/auth") {
-        const authResp = await handleAuth(upstream, url, authorization, isDockerHub);
-        return await fixResponse(authResp, request.method);
+    // 2. 处理 Token 认证 (v2/auth)
+    if (req.url.startsWith("/v2/auth")) {
+        return await handleAuth(upstream, req, res, isDockerHub);
     }
 
-    // 3. DockerHub 路径补全
-    let currentPath = url.pathname;
+    // 3. 构造上游路径
+    let targetPath = req.url;
     if (isDockerHub) {
-        const pathParts = currentPath.split("/");
+        const pathParts = targetPath.split("/");
         if (pathParts.length === 5 && pathParts[1] === "v2" && !pathParts[2].includes("/")) {
             pathParts.splice(2, 0, "library");
-            currentPath = pathParts.join("/");
+            targetPath = pathParts.join("/");
         }
     }
 
-    // 4. 发起上游请求 (强制 GET)
-    const targetUrl = new URL(upstream + currentPath + url.search);
-    const newReq = new Request(targetUrl, {
-        method: "GET",
-        headers: request.headers,
-        redirect: "follow",
-    });
+    // 4. 转发请求到上游
+    const targetUrl = upstream + targetPath;
 
-    const resp = await fetch(newReq);
+    try {
+        const response = await fetch(targetUrl, {
+            method: req.method,
+            headers: filterHeaders(req.headers),
+            redirect: 'manual'
+        });
 
-    // 5. 如果是 401，返回我们自己构造的、带长度的 401
-    if (resp.status === 401) {
-        return responseUnauthorized(url);
+        // 处理重定向 (特别是 DockerHub 的 Blob 下载)
+        if ([301, 302, 307, 308].includes(response.status)) {
+            const location = response.headers.get('location');
+            if (location) {
+                // 如果是重定向到存储桶，直接重定向让客户端自己下载，或者再次代理
+                res.setHeader('Location', location);
+                return res.status(response.status).end();
+            }
+        }
+
+        // 处理 401
+        if (response.status === 401) {
+            return responseUnauthorized(res, host);
+        }
+
+        // 5. 核心修复：手动读取 Body 并设置 Content-Length
+        const body = await response.buffer();
+
+        // 复制所有上游 Header
+        response.headers.forEach((value, key) => {
+            // 跳过可能导致冲突的编码头
+            if (['transfer-encoding', 'content-encoding', 'connection'].includes(key.toLowerCase())) return;
+            res.setHeader(key, value);
+        });
+
+        // 强制设置关键 Header
+        res.setHeader('Docker-Distribution-Api-Version', 'registry/2.0');
+        res.setHeader('Content-Length', body.length);
+        res.setHeader('Access-Control-Allow-Origin', '*');
+
+        // 发送响应
+        return res.status(response.status).send(body);
+
+    } catch (error) {
+        console.error("Proxy Error:", error);
+        return res.status(500).end("Internal Server Error");
     }
-
-    // 6. 所有响应都强制注入 Content-Length
-    return await fixResponse(resp, request.method);
-}
+};
 
 /**
- * 极其严格的响应头修复
+ * 认证逻辑
  */
-async function fixResponse(resp, originalMethod) {
-    const newHeaders = new Headers(resp.headers);
-    newHeaders.set("Docker-Distribution-Api-Version", "registry/2.0");
-    newHeaders.set("Access-Control-Allow-Origin", "*");
+async function handleAuth(upstream, req, res, isDockerHub) {
+    const resp = await fetch(upstream + "/v2/", { method: "GET" });
+    const authHeader = resp.headers.get("www-authenticate");
+    if (!authHeader) return res.status(resp.status).end();
 
-    // 必须读取为 ArrayBuffer，确保我们知道确切字节数
-    const body = await resp.arrayBuffer();
-    const uint8Body = new Uint8Array(body);
+    const matches = authHeader.match(/(?<=\=")(?:\\.|[^"\\])*(?=")/g);
+    if (!matches || matches.length < 2) return res.status(401).end();
 
-    newHeaders.set("Content-Length", uint8Body.byteLength.toString());
-    // 强行删除分块传输标志
-    newHeaders.delete("transfer-encoding");
-    newHeaders.set("Connection", "keep-alive");
+    const realm = matches[0];
+    const service = matches[1];
 
-    // 即使是 HEAD，我们也给 Vercel 返回 Body，让它自己去剥离，但保留我们的 Header
-    return new Response(uint8Body, {
-        status: resp.status,
-        statusText: resp.statusText,
-        headers: newHeaders,
-    });
-}
-
-function responseUnauthorized(url) {
-    const bodyText = JSON.stringify({ message: "UNAUTHORIZED" });
-    const uint8Body = new TextEncoder().encode(bodyText);
-
-    const headers = new Headers();
-    headers.set("Www-Authenticate", `Bearer realm="https://${url.hostname}/v2/auth",service="vercel-docker-proxy"`);
-    headers.set("Content-Type", "application/json; charset=utf-8");
-    headers.set("Content-Length", uint8Body.byteLength.toString());
-    headers.set("Docker-Distribution-Api-Version", "registry/2.0");
-
-    return new Response(uint8Body, { status: 401, headers });
-}
-
-async function handleAuth(upstream, url, authorization, isDockerHub) {
-    const checkUrl = new URL(upstream + "/v2/");
-    const resp = await fetch(checkUrl.toString(), { method: "GET", redirect: "follow" });
-    const authenticateStr = resp.headers.get("WWW-Authenticate");
-    if (!authenticateStr) return resp;
-
-    const re = /(?<=\=")(?:\\.|[^"\\])*(?=")/g;
-    const matches = authenticateStr.match(re);
-    if (!matches || matches.length < 2) return resp;
-
-    const tokenUrl = new URL(matches[0]);
-    if (matches[1]) tokenUrl.searchParams.set("service", matches[1]);
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const tokenUrl = new URL(realm);
+    tokenUrl.searchParams.set("service", service);
 
     let scope = url.searchParams.get("scope");
     if (scope && isDockerHub) {
@@ -128,8 +123,33 @@ async function handleAuth(upstream, url, authorization, isDockerHub) {
     }
     if (scope) tokenUrl.searchParams.set("scope", scope);
 
-    const headers = new Headers();
-    if (authorization) headers.set("Authorization", authorization);
+    const tokenResp = await fetch(tokenUrl.toString(), {
+        headers: req.headers.authorization ? { 'Authorization': req.headers.authorization } : {}
+    });
 
-    return await fetch(tokenUrl.toString(), { method: "GET", headers });
+    const body = await tokenResp.buffer();
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Length', body.length);
+    return res.status(tokenResp.status).send(body);
+}
+
+/**
+ * 构造统一的 401 响应
+ */
+function responseUnauthorized(res, host) {
+    const body = JSON.stringify({ message: "UNAUTHORIZED" });
+    res.setHeader('Www-Authenticate', `Bearer realm="https://${host}/v2/auth",service="vercel-docker-proxy"`);
+    res.setHeader('Docker-Distribution-Api-Version', 'registry/2.0');
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Content-Length', Buffer.byteLength(body));
+    return res.status(401).send(body);
+}
+
+function filterHeaders(headers) {
+    const out = {};
+    Object.keys(headers).forEach(key => {
+        if (['host', 'connection'].includes(key.toLowerCase())) return;
+        out[key] = headers[key];
+    });
+    return out;
 }
