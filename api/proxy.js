@@ -157,31 +157,3 @@ function responseUnauthorized(url) {
         headers,
     });
 }
-// 辅助函数 (保持逻辑一致)
-function parseAuthenticate(authenticateStr) {
-    const re = /(?<=\=")(?:\\.|[^"\\])*(?=")/g;
-    const matches = authenticateStr.match(re);
-    if (!matches || matches.length < 2) throw new Error("Invalid Www-Authenticate Header");
-    return { realm: matches[0], service: matches[1] };
-}
-
-async function fetchToken(wwwAuthenticate, scope, authorization) {
-    const url = new URL(wwwAuthenticate.realm);
-    if (wwwAuthenticate.service) url.searchParams.set("service", wwwAuthenticate.service);
-    if (scope) url.searchParams.set("scope", scope);
-
-    const headers = new Headers();
-    if (authorization) headers.set("Authorization", authorization);
-    return await fetch(url.toString(), { method: "GET", headers });
-}
-
-function responseUnauthorized(url) {
-    const headers = new Headers();
-    const realm = `${MODE === "debug" ? "http" : "https"}://${url.host}/v2/auth`;
-    headers.set("Www-Authenticate", `Bearer realm="${realm}",service="vercel-docker-proxy"`);
-
-    return new Response(JSON.stringify({ message: "UNAUTHORIZED" }), {
-        status: 401,
-        headers,
-    });
-}
