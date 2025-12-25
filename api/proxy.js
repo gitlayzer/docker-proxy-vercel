@@ -1,16 +1,12 @@
 export const config = {
-    // 指定使用 Edge Runtime
-    runtime: 'edge',
+    runtime: 'edge', // 必须使用 Edge Runtime
 };
 
-// 定义 Docker Hub 的 URL
 const dockerHub = "https://registry-1.docker.io";
-
-// 从环境变量获取配置
 const CUSTOM_DOMAIN = process.env.CUSTOM_DOMAIN;
 const MODE = process.env.MODE || "production";
-const TARGET_UPSTREAM = process.env.TARGET_UPSTREAM || "";
 
+// 路由映射表
 const routes = {
     [`docker.${CUSTOM_DOMAIN}`]: dockerHub,
     [`quay.${CUSTOM_DOMAIN}`]: "https://quay.io",
@@ -20,7 +16,6 @@ const routes = {
     [`ghcr.${CUSTOM_DOMAIN}`]: "https://ghcr.io",
     [`cloudsmith.${CUSTOM_DOMAIN}`]: "https://docker.cloudsmith.io",
     [`ecr.${CUSTOM_DOMAIN}`]: "https://public.ecr.aws",
-    [`docker-staging.${CUSTOM_DOMAIN}`]: dockerHub,
 };
 
 export default async function handler(request) {
@@ -28,26 +23,33 @@ export default async function handler(request) {
     const hostname = url.hostname;
     const upstream = routes[hostname] || "";
 
+    // 1. 检查目标后端是否存在
     if (!upstream) {
-        return new Response(JSON.stringify({ message: "Host Not Found", hostname, routes }), { status: 404 });
+        return new Response(JSON.stringify({
+            message: "Host Not Found",
+            hostname,
+            tip: "请检查环境变量 CUSTOM_DOMAIN 配置是否正确"
+        }), { status: 404 });
     }
 
     const isDockerHub = upstream === dockerHub;
     const authorization = request.headers.get("Authorization");
 
-    // 1. 处理首页
+    // 2. 首页重定向
     if (url.pathname === "/") {
         return Response.redirect(`${url.protocol}//${url.host}/v2/`, 301);
     }
 
-    // 2. 处理 Auth 逻辑 (修复 ReferenceError)
+    // 3. 处理 Token 认证请求 (/v2/auth)
     if (url.pathname === "/v2/auth") {
         return await handleAuth(upstream, url, authorization, isDockerHub);
     }
 
-    // 3. DockerHub Library 路径自动重定向 (针对没有 library/ 前缀的情况)
+    // 4. DockerHub Library 路径自动补全 (例如 nginx -> library/nginx)
+    let currentPath = url.pathname;
     if (isDockerHub) {
-        const pathParts = url.pathname.split("/");
+        const pathParts = currentPath.split("/");
+        // 匹配 /v2/xxxxx/manifests/... 或 /v2/xxxxx/blobs/...
         if (pathParts.length === 5 && pathParts[1] === "v2" && !pathParts[2].includes("/")) {
             const redirectUrl = new URL(url);
             pathParts.splice(2, 0, "library");
@@ -56,70 +58,93 @@ export default async function handler(request) {
         }
     }
 
-    // 4. 转发请求
-    const targetUrl = new URL(upstream + url.pathname + url.search);
+    // 5. 构造转发请求
+    const targetUrl = new URL(upstream + currentPath + url.search);
     const newReq = new Request(targetUrl, {
         method: request.method,
         headers: request.headers,
-        redirect: "manual",
+        redirect: "manual", // 手动处理重定向以控制 Header
     });
 
     const resp = await fetch(newReq);
 
-    // 5. 处理重定向 (特别是 DockerHub 的 Blob 下载地址)
+    // 6. 处理后端重定向 (主要针对 DockerHub 的 Blob 下载地址)
     if ([301, 302, 307, 308].includes(resp.status)) {
         const location = resp.headers.get("Location");
         if (location) {
             const blobResp = await fetch(location, {
-                method: "GET",
+                method: request.method,
+                headers: { "Authorization": authorization || "" },
                 redirect: "follow"
             });
-            return fixResponse(blobResp);
+            return await fixResponse(blobResp, request.method);
         }
     }
 
-    if (resp.status === 401) return responseUnauthorized(url);
+    // 7. 处理 401 Unauthorized，引导客户端去我们的 /v2/auth 获取 Token
+    if (resp.status === 401) {
+        return responseUnauthorized(url);
+    }
 
-    return fixResponse(resp);
+    // 8. 正常响应修复
+    return await fixResponse(resp, request.method);
 }
 
 /**
- * 核心修复函数：确保 Content-Length 和关键 Header 不丢失
+ * 核心修复函数：解决 Docker 报错 Content-Length 缺失的问题
  */
-async function fixResponse(resp) {
+async function fixResponse(resp, originalMethod) {
     const newHeaders = new Headers(resp.headers);
+
+    // 注入 Docker 规范要求的版本头
     newHeaders.set("Docker-Distribution-Api-Version", "registry/2.0");
     newHeaders.set("Access-Control-Allow-Origin", "*");
+    newHeaders.set("Access-Control-Expose-Headers", "Docker-Content-Digest, Content-Length");
 
-    // 关键：强制保留 Content-Length，防止 Vercel 转为 chunked 编码导致 Docker 报错
+    // 提取原始 Content-Length
     const contentLength = resp.headers.get("content-length");
+
+    // 针对 Manifest (JSON) 文件：
+    // 必须读取整个 body 为 ArrayBuffer 才能让 Vercel 知道确切长度，从而避免发送 chunked 编码
+    const contentType = resp.headers.get("content-type") || "";
+    if (contentType.includes("json") || contentType.includes("manifest")) {
+        const body = await resp.arrayBuffer();
+        const actualLength = body.byteLength.toString();
+
+        newHeaders.set("Content-Length", actualLength);
+
+        // 如果是 HEAD 请求，根据规范不返回 body，但必须带上 Content-Length
+        if (originalMethod === "HEAD") {
+            return new Response(null, { status: resp.status, headers: newHeaders });
+        }
+        return new Response(body, { status: resp.status, headers: newHeaders });
+    }
+
+    // 针对 Blob 或其他流数据
     if (contentLength) {
         newHeaders.set("Content-Length", contentLength);
     }
 
-    // 针对 Manifest (JSON) 类型，读取 buffer 强制触发 Vercel 计算长度
-    const contentType = resp.headers.get("content-type") || "";
-    if (contentType.includes("json") || contentType.includes("manifest")) {
-        const body = await resp.arrayBuffer();
-        return new Response(body, { status: resp.status, headers: newHeaders });
+    if (originalMethod === "HEAD") {
+        return new Response(null, { status: resp.status, headers: newHeaders });
     }
 
     return new Response(resp.body, { status: resp.status, headers: newHeaders });
 }
 
 /**
- * 处理 Token 获取
+ * 处理 Token 获取逻辑
  */
 async function handleAuth(upstream, url, authorization, isDockerHub) {
-    const newUrl = new URL(upstream + "/v2/");
-    const resp = await fetch(newUrl.toString(), { method: "GET", redirect: "follow" });
+    const checkUrl = new URL(upstream + "/v2/");
+    const resp = await fetch(checkUrl.toString(), { method: "GET", redirect: "follow" });
 
     if (resp.status !== 401) return resp;
 
     const authenticateStr = resp.headers.get("WWW-Authenticate");
     if (!authenticateStr) return resp;
 
-    // 解析 realm 和 service
+    // 正则解析 realm (认证服务器地址) 和 service
     const re = /(?<=\=")(?:\\.|[^"\\])*(?=")/g;
     const matches = authenticateStr.match(re);
     if (!matches || matches.length < 2) return resp;
@@ -131,6 +156,7 @@ async function handleAuth(upstream, url, authorization, isDockerHub) {
     if (service) tokenUrl.searchParams.set("service", service);
 
     let scope = url.searchParams.get("scope");
+    // DockerHub 范围修正
     if (scope && isDockerHub) {
         let scopeParts = scope.split(":");
         if (scopeParts.length === 3 && !scopeParts[1].includes("/")) {
@@ -143,9 +169,13 @@ async function handleAuth(upstream, url, authorization, isDockerHub) {
     const headers = new Headers();
     if (authorization) headers.set("Authorization", authorization);
 
+    // 向真实的 Auth 服务器请求 Token
     return await fetch(tokenUrl.toString(), { method: "GET", headers });
 }
 
+/**
+ * 构造 401 响应，指引 Docker 客户端访问我们的代理由此获取 Token
+ */
 function responseUnauthorized(url) {
     const headers = new Headers();
     const authRealm = `https://${url.hostname}/v2/auth`;
